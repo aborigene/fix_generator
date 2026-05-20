@@ -13,6 +13,7 @@ Foi construído para alimentar **Blueprints no BindPlane** com fluxos realistas 
 - [Uso](#uso)
 - [Fluxos disponíveis](#fluxos-disponíveis)
 - [Saída — SOH vs. readable](#saída--soh-vs-readable)
+- [Envio TCP para GIGAMON / tap](#envio-tcp-para-gigamon--tap)
 - [Detalhes do protocolo](#detalhes-do-protocolo)
 - [Ativos de referência](#ativos-de-referência)
 - [Validação](#validação)
@@ -31,6 +32,7 @@ Foi construído para alimentar **Blueprints no BindPlane** com fluxos realistas 
 - Timestamps em janela plausível de pregão (13:00–20:55 UTC = 10:00–17:55 BRT)
 - Grupo `NoPartyIDs` (453/448/447/452) incluído nas mensagens de ordem
 - 5 fluxos pré-construídos cobrindo ciclo de vida completo
+- Modo `--send host:port` faz stream TCP direto (raw SOH) para alimentar tap/packet broker
 
 ---
 
@@ -63,6 +65,9 @@ python3 fix_generator.py --flow 5 --volume 100 --output stress.fix
 
 # Versão legível em arquivo
 python3 fix_generator.py --flow 5 --volume 100 -r -o stress.txt
+
+# Envio TCP direto para um tap/packet broker (ver seção "Envio TCP")
+python3 fix_generator.py --flow 5 --volume 200 --send 10.0.0.5:9876 --delay-ms 100
 ```
 
 ### Flags
@@ -70,10 +75,14 @@ python3 fix_generator.py --flow 5 --volume 100 -r -o stress.txt
 | Flag | Descrição |
 |------|-----------|
 | `--flow N` | Número do fluxo (1–5) |
-| `-r`, `--readable` | Usa `\|` no lugar de SOH (debug) |
-| `--annotate` | Prefixa cada mensagem com `# CLIENT->B3` / `# B3->CLIENT` |
+| `-r`, `--readable` | Usa `\|` no lugar de SOH (debug; ignorado com `--send`) |
+| `--annotate` | Prefixa cada mensagem com `# CLIENT->B3` / `# B3->CLIENT` (ignorado com `--send`) |
 | `--volume N` | Apenas fluxo 5: total mínimo de mensagens (default 50) |
 | `-o`, `--output FILE` | Escreve em arquivo em vez de stdout |
+| `--send HOST:PORT` | Faz stream TCP raw (SOH) para o endpoint informado |
+| `--delay-ms N` | Intervalo entre mensagens em modo `--send` (default 50ms) |
+| `--loop` | Em `--send`, repete o fluxo indefinidamente até Ctrl-C |
+| `--client-only` | Em `--send`, envia apenas mensagens `CLIENT->B3` |
 | `--list-flows` | Lista fluxos e sai |
 
 ---
@@ -127,6 +136,75 @@ Este é o formato esperado pelo BindPlane. Quando `--output` é usado sem `--rea
 ```
 
 `--annotate` força saída por linha (com ou sem `-r`) e adiciona o comentário de direção.
+
+---
+
+## Envio TCP para GIGAMON / tap
+
+O modo `--send HOST:PORT` abre uma conexão TCP e faz stream das mensagens **sempre em SOH binário** (a flag `--readable` é ignorada nesse modo — o que vai na rede é o que um peer FIX real veria). É a forma recomendada de gerar tráfego para um **GIGAMON tap**, um **packet broker** ou um agente que escuta numa porta TCP.
+
+### Cenários
+
+**Tap passivo / GIGAMON** — quer ver os dois lados da sessão (cliente + servidor) atravessando a interface monitorada:
+
+```bash
+python3 fix_generator.py --flow 5 --volume 200 \
+    --send 10.0.0.5:9876 --delay-ms 100
+```
+
+**Replay infinito** — útil para deixar tráfego constante rodando enquanto você ajusta o Blueprint:
+
+```bash
+python3 fix_generator.py --flow 5 --send 10.0.0.5:9876 --loop --delay-ms 50
+```
+
+**FIX acceptor real** — quando o destino é um motor FIX que vai responder, não um tap passivo:
+
+```bash
+python3 fix_generator.py --flow 1 --send <fix-engine>:<port> \
+    --client-only --delay-ms 200
+```
+
+`--client-only` filtra apenas mensagens `CLIENT->B3`; as respostas `B3->CLIENT` ficam de fora porque o motor real é quem vai gerá-las.
+
+### Comportamento de rede
+
+- `TCP_NODELAY` ativado — cada mensagem vai imediatamente, sem buffering Nagle. Importante para que o tap enxergue a cadência configurada por `--delay-ms`.
+- Suporta IPv6 via `[::1]:9876`.
+- Trata `BrokenPipeError` / `ConnectionResetError` se o peer fechar a conexão no meio do stream.
+- Logs de progresso vão para **stderr** (stdout fica livre para pipes).
+- `Ctrl-C` interrompe imediatamente; em `--loop` é a única forma de parar.
+
+### Validação rápida (loopback)
+
+Sobe um listener Python local, manda um fluxo e confere os bytes que chegaram:
+
+```bash
+# Terminal 1 — listener
+python3 -c "
+import socket
+srv = socket.socket(); srv.bind(('127.0.0.1', 19876)); srv.listen(1)
+conn, _ = srv.accept(); buf = b''
+while True:
+    chunk = conn.recv(4096)
+    if not chunk: break
+    buf += chunk
+print(f'{len(buf)} bytes, {buf.count(chr(1).encode() + b\"10=\")} msgs')
+"
+
+# Terminal 2 — sender
+python3 fix_generator.py --flow 1 --send 127.0.0.1:19876 --delay-ms 10
+```
+
+### Alternativas
+
+Se você não precisa de timing controlado, dá para usar `netcat` consumindo a saída padrão (o script já emite SOH binário em modo default):
+
+```bash
+python3 fix_generator.py --flow 5 | nc 10.0.0.5 9876
+```
+
+Para fidelidade a nível de pacote (timing exato, MAC/IP source customizados), gere um PCAP e use `tcpreplay` — fora do escopo deste script.
 
 ---
 

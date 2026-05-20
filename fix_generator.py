@@ -6,9 +6,11 @@ Generates realistic FIX message flows for testing BindPlane Blueprints,
 following the B3 EntryPoint Message Specification v2.40.
 
 Usage:
-    python fix_generator.py --flow 1                  # SOH separator (binary)
-    python fix_generator.py --flow 1 --readable       # '|' separator (debug)
+    python fix_generator.py --flow 1                          # SOH separator (binary)
+    python fix_generator.py --flow 1 --readable               # '|' separator (debug)
     python fix_generator.py --flow 5 --output out.fix
+    python fix_generator.py --flow 5 --send 10.0.0.5:9876     # stream to TCP listener
+    python fix_generator.py --flow 5 --send host:port --loop  # replay forever
     python fix_generator.py --list-flows
 """
 
@@ -16,7 +18,9 @@ from __future__ import annotations
 
 import argparse
 import random
+import socket
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
@@ -525,20 +529,87 @@ def render(messages: Iterable[tuple[str, str]], readable: bool,
     return sep.join(out_lines) + (sep if out_lines else "")
 
 
+def parse_endpoint(value: str) -> tuple[str, int]:
+    """Parse 'host:port' (IPv4/hostname) or '[host]:port' (IPv6)."""
+    if value.startswith("["):
+        host_end = value.index("]")
+        host = value[1:host_end]
+        port = int(value[host_end + 2:])
+    else:
+        host, _, port_s = value.rpartition(":")
+        if not host or not port_s:
+            raise ValueError(f"expected host:port, got {value!r}")
+        port = int(port_s)
+    return host, port
+
+
+def send_over_tcp(messages: list[tuple[str, str]], host: str, port: int,
+                  delay_ms: int, loop: bool,
+                  client_only: bool) -> None:
+    """
+    Stream messages over a TCP connection — one byte stream, SOH-delimited,
+    as a real FIX peer would.
+
+    By default both CLIENT->B3 and B3->CLIENT messages are sent (useful when
+    feeding a passive tap/IDS like GIGAMON). Use client_only=True to send
+    only the client side, e.g. when talking to a real FIX acceptor.
+    """
+    addr = (host, port)
+    sys.stderr.write(f"connecting to {host}:{port} ...\n")
+    with socket.create_connection(addr) as sock:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sys.stderr.write(f"connected; streaming {len(messages)} msgs"
+                         f" (delay={delay_ms}ms, loop={loop})\n")
+        iteration = 0
+        try:
+            while True:
+                iteration += 1
+                sent = 0
+                for direction, raw in messages:
+                    if client_only and direction != "CLIENT->B3":
+                        continue
+                    sock.sendall(raw.encode("ascii"))
+                    sent += 1
+                    if delay_ms > 0:
+                        time.sleep(delay_ms / 1000.0)
+                sys.stderr.write(f"iteration {iteration}: {sent} msgs sent\n")
+                if not loop:
+                    break
+        except KeyboardInterrupt:
+            sys.stderr.write("\ninterrupted by user\n")
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            sys.stderr.write(f"\npeer closed connection: {exc}\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="FIX 4.4 message generator for B3 EntryPoint.")
     parser.add_argument("--flow", type=int, choices=sorted(FLOWS.keys()),
                         help="Flow number to generate (see --list-flows).")
     parser.add_argument("-r", "--readable", action="store_true",
-                        help="Use '|' instead of SOH for visual inspection.")
+                        help="Use '|' instead of SOH for visual inspection "
+                             "(ignored when --send is used).")
     parser.add_argument("--annotate", action="store_true",
                         help="Prefix each message with a CLIENT->B3 / B3->CLIENT "
-                             "comment line (forces line-separated output).")
+                             "comment line (forces line-separated output; "
+                             "ignored when --send is used).")
     parser.add_argument("--volume", type=int, default=50,
                         help="Number of messages for flow 5 (default: 50).")
     parser.add_argument("--output", "-o", type=str,
                         help="Write output to file instead of stdout.")
+    parser.add_argument("--send", type=str, metavar="HOST:PORT",
+                        help="Stream messages over a TCP connection (raw SOH, "
+                             "regardless of --readable). Useful for feeding a "
+                             "GIGAMON tap or a packet broker.")
+    parser.add_argument("--delay-ms", type=int, default=50,
+                        help="Delay between messages when using --send "
+                             "(default: 50ms).")
+    parser.add_argument("--loop", action="store_true",
+                        help="With --send, replay the flow indefinitely until "
+                             "Ctrl-C or the peer closes the connection.")
+    parser.add_argument("--client-only", action="store_true",
+                        help="With --send, transmit only CLIENT->B3 messages "
+                             "(use when the peer is a real FIX acceptor).")
     parser.add_argument("--list-flows", action="store_true",
                         help="List available flows and exit.")
     args = parser.parse_args(argv)
@@ -557,6 +628,13 @@ def main(argv: list[str] | None = None) -> int:
         builder(session, args.volume)
     else:
         builder(session)
+
+    if args.send:
+        host, port = parse_endpoint(args.send)
+        send_over_tcp(session.messages, host, port,
+                      delay_ms=args.delay_ms, loop=args.loop,
+                      client_only=args.client_only)
+        return 0
 
     output = render(session.messages, args.readable, args.annotate)
 
